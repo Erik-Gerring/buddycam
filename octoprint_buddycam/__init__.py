@@ -1,78 +1,145 @@
 # coding=utf-8
 from __future__ import absolute_import
 
-### (Don't forget to remove me)
-# This is a basic skeleton for your plugin's __init__.py. You probably want to adjust the class name of your plugin
-# as well as the plugin mixins it's subclassing from. This is really just a basic skeleton to get you started,
-# defining your plugin as a template plugin, settings and asset plugin. Feel free to add or remove mixins
-# as necessary.
-#
-# Take a look at the documentation on what other plugin mixins are available.
+import time
+import threading
+import subprocess
 
+import flask
 import octoprint.plugin
 
-class BuddycamPlugin(octoprint.plugin.SettingsPlugin,
-    octoprint.plugin.AssetPlugin,
-    octoprint.plugin.TemplatePlugin
-):
 
-    ##~~ SettingsPlugin mixin
+class BuddycamPlugin(
+    octoprint.plugin.SettingsPlugin,
+    octoprint.plugin.BlueprintPlugin,
+    octoprint.plugin.StartupPlugin,
+):
+    def __init__(self):
+        self._cache_lock = threading.Lock()
+        self._cached_jpeg = None
+        self._cached_at = 0.0
+        self._last_error = None
+
+    # ---- Settings ----
 
     def get_settings_defaults(self):
-        return {
-            # put your plugin's default settings here
-        }
+        return dict(
+            input_url="",              # rtsp://...
+            ffmpeg_path="ffmpeg",      # or full path e.g. /usr/bin/ffmpeg
+            rtsp_transport="tcp",      # tcp is usually more stable than udp
+            timeout_sec=6,             # kill ffmpeg if it hangs
+            cache_ttl_ms=750,          # avoid spawning ffmpeg too often
+            extra_input_args="",       # optional: advanced flags, space-separated
+        )
 
-    ##~~ AssetPlugin mixin
+    def on_after_startup(self):
+        self._logger.info("Buddycam: FFmpeg snapshot endpoint loaded")
 
-    def get_assets(self):
-        # Define your plugin's asset files to automatically include in the
-        # core UI here.
-        return {
-            "js": ["js/buddycam.js"],
-            "css": ["css/buddycam.css"],
-            "less": ["less/buddycam.less"]
-        }
+    # ---- Blueprint security ----
 
-    ##~~ Softwareupdate hook
+    def is_blueprint_protected(self):
+        # Must be public so OctoPrint (and dashboards) can pull snapshots without login
+        return False
 
-    def get_update_information(self):
-        # Define the configuration for your plugin to use with the Software Update
-        # Plugin here. See https://docs.octoprint.org/en/main/bundledplugins/softwareupdate.html
-        # for details.
-        return {
-            "buddycam": {
-                "displayName": "Buddycam Plugin",
-                "displayVersion": self._plugin_version,
+    def is_blueprint_csrf_protected(self):
+        # GET-only endpoint
+        return False
 
-                # version check: github repository
-                "type": "github_release",
-                "user": "Erik-Gerring",
-                "repo": "OctoPrint-Buddycam",
-                "current": self._plugin_version,
+    # ---- Public snapshot endpoint ----
 
-                # update method: pip
-                "pip": "https://github.com/Erik-Gerring/OctoPrint-Buddycam/archive/{target_version}.zip",
-            }
-        }
+    @octoprint.plugin.BlueprintPlugin.route("/snapshot", methods=["GET"])
+    def snapshot(self):
+        ttl_ms = int(self._settings.get_int(["cache_ttl_ms"]) or 0)
+
+        # Serve cached JPEG if still fresh
+        with self._cache_lock:
+            if self._cached_jpeg is not None and ttl_ms > 0:
+                age_ms = (time.time() - self._cached_at) * 1000.0
+                if age_ms <= ttl_ms:
+                    return self._make_jpeg_response(self._cached_jpeg)
+
+        # Otherwise capture a new frame
+        jpeg = self._ffmpeg_grab_jpeg()
+
+        # Cache it
+        with self._cache_lock:
+            self._cached_jpeg = jpeg
+            self._cached_at = time.time()
+
+        return self._make_jpeg_response(jpeg)
+
+    def _make_jpeg_response(self, jpeg_bytes):
+        resp = flask.make_response(jpeg_bytes)
+        resp.headers["Content-Type"] = "image/jpeg"
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
+
+    # ---- ffmpeg snapshot ----
+
+    def _ffmpeg_grab_jpeg(self):
+        input_url = (self._settings.get(["input_url"]) or "").strip()
+        if not input_url:
+            flask.abort(400, description="Buddycam: input_url is not configured")
+
+        ffmpeg = (self._settings.get(["ffmpeg_path"]) or "ffmpeg").strip()
+        transport = (self._settings.get(["rtsp_transport"]) or "tcp").strip()
+        timeout = float(self._settings.get_int(["timeout_sec"]) or 6)
+
+        extra = (self._settings.get(["extra_input_args"]) or "").strip().split()
+        # Example extras you might want later:
+        #   -stimeout 5000000
+        #   -fflags nobuffer
+        #   -flags low_delay
+
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",
+        ]
+
+        # RTSP options (only if it looks like RTSP)
+        if input_url.lower().startswith("rtsp://"):
+            cmd += ["-rtsp_transport", transport]
+
+        # Insert any extra input args (advanced users)
+        cmd += extra
+
+        # Input + single-frame output to stdout
+        cmd += [
+            "-i", input_url,
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "pipe:1",
+        ]
+
+        try:
+            p = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self._last_error = f"ffmpeg timed out after {timeout:.1f}s"
+            self._logger.warning("Buddycam: %s", self._last_error)
+            flask.abort(504, description="Buddycam: snapshot timed out")
+
+        if p.returncode != 0 or not p.stdout:
+            err = (p.stderr or b"").decode("utf-8", errors="replace").strip()
+            self._last_error = f"ffmpeg failed rc={p.returncode}: {err}"
+            self._logger.warning("Buddycam: %s", self._last_error)
+            flask.abort(502, description="Buddycam: could not capture snapshot")
+
+        self._last_error = None
+        return p.stdout
 
 
-# If you want your plugin to be registered within OctoPrint under a different name than what you defined in setup.py
-# ("OctoPrint-PluginSkeleton"), you may define that here. Same goes for the other metadata derived from setup.py that
-# can be overwritten via __plugin_xyz__ control properties. See the documentation for that.
-__plugin_name__ = "Buddycam Plugin"
+__plugin_name__ = "Buddycam"
+__plugin_pythoncompat__ = ">=3,<4"
 
-
-# Set the Python version your plugin is compatible with below. Recommended is Python 3 only for all new plugins.
-# OctoPrint 1.4.0 - 1.7.x run under both Python 3 and the end-of-life Python 2.
-# OctoPrint 1.8.0 onwards only supports Python 3.
-__plugin_pythoncompat__ = ">=3,<4"  # Only Python 3
 
 def __plugin_load__():
     global __plugin_implementation__
     __plugin_implementation__ = BuddycamPlugin()
-
-    global __plugin_hooks__
-    __plugin_hooks__ = {
-        "octoprint.plugin.softwareupdate.check_config": __plugin_implementation__.get_update_information
-    }
