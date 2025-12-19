@@ -116,6 +116,11 @@ class BuddycamPlugin(
         Resp = flask.make_response(JpegBytes)
         Resp.headers["Content-Type"] = "image/jpeg"
         Resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+
+        # Allow dashboards on other hosts to request this endpoint.
+        Resp.headers["Access-Control-Allow-Origin"] = "*"
+        Resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    
         return Resp
 
 
